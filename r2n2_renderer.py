@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
+'''
+Copyright (c) 2023 by Haiming Zhang. All Rights Reserved.
 
-import sys
-import os
-sys.path.insert(0, os.getcwd()) # HACK add the root folder
+Author: Haiming Zhang
+Date: 2023-04-07 13:12:40
+Email: haimingzhang@link.cuhk.edu.cn
+Description: 
+Reference: 
+'''
 
 import time
 import os
+import sys
 import contextlib
 from math import radians
-import numpy as np
-from PIL import Image
-from tempfile import TemporaryFile
-from lib.utils import stdout_redirected
-from lib.config import cfg
+# from PIL import Image
+import random
 import bpy
 
+SHAPENET_ROOT = '/data1/zhanghm/Datasets/ShapeNet/ShapeNetCore.v1/'
+DIR_RENDERING_PATH = './data/render_2'
+TEST_RENDERING_PATH = './data/render_test'
+RENDERING_MAX_CAMERA_DIST = 1.75
+N_VIEWS = 24
+RENDERING_BLENDER_TMP_DIR = '/tmp/blender'
 
 def voxel2mesh(voxels):
     cube_verts = [[0, 0, 0],
@@ -115,9 +124,14 @@ class BaseRenderer:
         world.horizon_color = (1, 1, 1)  # set background color to be white
 
         # set file name for storing rendering result
-        self.result_fn = '%s/render_result_%d.png' % (cfg.DIR.RENDERING_PATH, os.getpid())
+        self.result_fn = '%s/render_result_%d.png' % (DIR_RENDERING_PATH, os.getpid())
         bpy.context.scene.render.filepath = self.result_fn
 
+        # new settings
+        bpy.context.scene.render.image_settings.file_format = 'PNG'
+        bpy.context.scene.render.image_settings.color_mode = 'RGBA'
+        bpy.context.scene.render.image_settings.use_zbuffer = True
+        
         self.render_context = render_context
         self.org_obj = org_obj
         self.camera = camera
@@ -135,9 +149,9 @@ class BaseRenderer:
     def setViewpoint(self, azimuth, altitude, yaw, distance_ratio, fov):
         self.org_obj.rotation_euler = (0, 0, 0)
         self.light.location = (distance_ratio *
-                               (cfg.RENDERING.MAX_CAMERA_DIST + 2), 0, 0)
+                               (RENDERING_MAX_CAMERA_DIST + 2), 0, 0)
         self.camera.location = (distance_ratio *
-                                cfg.RENDERING.MAX_CAMERA_DIST, 0, 0)
+                                RENDERING_MAX_CAMERA_DIST, 0, 0)
         self.org_obj.rotation_euler = (radians(-yaw),
                                        radians(-altitude),
                                        radians(-azimuth))
@@ -186,7 +200,7 @@ class BaseRenderer:
                             (file_path, file_path[-4:]))
 
     def render(self, load_model=True, clear_model=True, resize_ratio=None,
-               return_image=True, image_path=os.path.join(cfg.RENDERING.BLENDER_TMP_DIR, 'tmp.png')):
+               return_image=True, image_path=os.path.join(RENDERING_BLENDER_TMP_DIR, 'tmp.png')):
         """ Render the object """
         if load_model:
             self.loadModel()
@@ -206,12 +220,6 @@ class BaseRenderer:
 
         if clear_model:
             self.clearModel()
-
-        if return_image:
-            im = np.array(Image.open(self.result_fn))  # read the image
-
-            # Last channel is the alpha channel (transparency)
-            return im[:, :, :3], im[:, :, 3]
 
 
 class ShapeNetRenderer(BaseRenderer):
@@ -265,10 +273,10 @@ class VoxelRenderer(BaseRenderer):
         light_2.data.energy = 0.7
 
     def render_voxel(self, pred, thresh=0.4,
-                     image_path=os.path.join(cfg.RENDERING.BLENDER_TMP_DIR, 'tmp.png')):
+                     image_path=os.path.join(RENDERING_BLENDER_TMP_DIR, 'tmp.png')):
         # Cleanup the scene
         self.clearModel()
-        out_f = os.path.join(cfg.RENDERING.BLENDER_TMP_DIR, 'tmp.obj')
+        out_f = os.path.join(RENDERING_BLENDER_TMP_DIR, 'tmp.obj')
         occupancy = pred > thresh
         vertices, faces = voxel2mesh(occupancy)
         with contextlib.suppress(IOError):
@@ -280,33 +288,142 @@ class VoxelRenderer(BaseRenderer):
         bpy.context.scene.render.filepath = image_path
         bpy.ops.render.render(write_still=True)  # save straight to file
 
-        im = np.array(Image.open(image_path))  # read the image
 
-        # Last channel is the alpha channel (transparency)
-        return im[:, :, :3], im[:, :, 3]
+import argparse
+def main(args):
+    file_paths = []
+    all_model_class = []
+    all_model_ids = []
 
+    with open(args.task_file, 'r') as f:
+        lines = f.readlines()
+        for line in lines:
+            if line == '': 
+                continue
 
-def main():
-    """Test function"""
-    # Modify the following file to visualize the model
-    dn = '/ShapeNet/ShapeNetCore.v1/02958343/'
-    model_id = [line.strip('\n') for line in open(dn + 'models.txt')]
-    file_paths = [os.path.join(dn, line, 'model.obj') for line in model_id]
+            tmp = line.rstrip('\n').split(' ')
+            all_model_class.append(tmp[0])
+            all_model_ids.append(tmp[1])
+            file_paths.append(os.path.join(SHAPENET_ROOT, tmp[0], tmp[1], 'model.obj'))
+    
     sum_time = 0
     renderer = ShapeNetRenderer()
-    renderer.initialize(file_paths, 500, 500)
+    renderer.initialize(file_paths, 224, 224)
+    for i, curr_model_id in enumerate(all_model_ids):
+        start = time.time()
+        rendering_curr_model_root = os.path.join(DIR_RENDERING_PATH, all_model_class[i], all_model_ids[i])
+
+        if not os.path.exists(rendering_curr_model_root):
+            os.mkdir(rendering_curr_model_root)
+
+        if os.path.exists(os.path.join(rendering_curr_model_root, 'rendering_exr', '%.2d.exr' % (N_VIEWS - 1))):
+            continue
+
+        with open( os.path.join(rendering_curr_model_root, 'renderings.txt'), 'w' ) as f:
+            for view_id in range(N_VIEWS):
+                print('%.2d' % view_id, file = f)
+
+        camera_file_f = open(os.path.join(rendering_curr_model_root, 'rendering_metadata.txt'), 'w')
+        
+        for view_id in range(N_VIEWS):
+            image_path = os.path.join(rendering_curr_model_root, 'rendering_exr', '%.2d.exr' % view_id)
+
+            az, el, depth_ratio = [360 * random.random(), 5 * random.random() + 25, 0.3 * random.random() + 0.65]
+        
+            renderer.setModelIndex(i)
+            renderer.setViewpoint(az, el, 0, depth_ratio, 25)
+
+            if view_id == 0:
+                load_model_flag = True
+            else:
+                load_model_flag = False
+
+            if view_id == N_VIEWS - 1:
+                clear_model_flag = True
+            else:
+                clear_model_flag = False
+
+            renderer.render(load_model=load_model_flag, return_image=False,
+                    clear_model=clear_model_flag, image_path=image_path)
+
+            print(az, el, 0, depth_ratio, 25, file=camera_file_f)
+            print('Saved at %s' % image_path)
+
+        camera_file_f.close()
+
+        end = time.time()
+        sum_time += end - start
+
+        if i % 10 == 0:
+            print(sum_time/(10))
+            sum_time = 0
+
+def main_single(args):
+    file_paths = [os.path.join(SHAPENET_ROOT, args.model_class, args.model_id, 'model.obj')]
+    renderer = ShapeNetRenderer()
+    renderer.initialize(file_paths, 256, 256)
+
+    rendering_curr_model_root = os.path.join(DIR_RENDERING_PATH, args.model_class, args.model_id)
+
+    if not os.path.exists(rendering_curr_model_root):
+        os.mkdir(rendering_curr_model_root)
+
+    if os.path.exists(os.path.join(rendering_curr_model_root, 'rendering', '%.2d.png' % (N_VIEWS - 1))):
+        return
+
+    with open( os.path.join(rendering_curr_model_root, 'renderings.txt'), 'w' ) as f:
+        for view_id in range(N_VIEWS):
+            print('%.2d' % view_id, file = f)
+
+    camera_file_f = open(os.path.join(rendering_curr_model_root, 'rendering_metadata.txt'), 'w')
+    
+    for view_id in range(N_VIEWS):
+        image_path = os.path.join(rendering_curr_model_root, 'rendering', '%.2d.png' % view_id)
+
+        az, el, depth_ratio = [360 * random.random(), 5 * random.random() + 25, 0.3 * random.random() + 0.65]
+    
+        renderer.setModelIndex(0)
+        renderer.setViewpoint(az, el, 0, depth_ratio, 25)
+
+        if view_id == 0:
+            load_model_flag = True
+        else:
+            load_model_flag = False
+
+        if view_id == N_VIEWS - 1:
+            clear_model_flag = True
+        else:
+            clear_model_flag = False
+
+        renderer.render(load_model=load_model_flag, return_image=False,
+                clear_model=clear_model_flag, image_path=image_path)
+
+        print(az, el, 0, depth_ratio, 25, file=camera_file_f)
+        print('Saved at %s' % image_path)
+
+    camera_file_f.close()
+
+def test():
+    """Test function"""
+    # Modify the following file to visualize the model
+    #dn = './external/ShapeNetCore.v1/02958343/'
+    #model_id = ['2c981b96364b1baa21a66e8dfcce514a']
+    dn = '/data1/zhanghm/Datasets/ShapeNet/ShapeNetCore.v1/02958343/'
+    model_id = ['f9c1d7748c15499c6f2bd1c4e9adb41']
+    file_paths = [os.path.join(dn, m_id, 'model.obj') for m_id in model_id]
+    sum_time = 0
+    renderer = ShapeNetRenderer()
+    renderer.initialize(file_paths, 224, 224)
     for i, curr_model_id in enumerate(model_id):
         start = time.time()
-        image_path = '%s/%s.png' % ('/tmp', curr_model_id[:-4])
+        image_path = '%s/%s.exr' % (TEST_RENDERING_PATH, curr_model_id)
 
-        az, el, depth_ratio = list(
-            *([360, 5, 0.3] * np.random.rand(1, 3) + [0, 25, 0.65]))
-
+        az, el, depth_ratio = [360 * random.random(), 5 * random.random() + 25, 0.3 * random.random() + 0.65]
+    
         renderer.setModelIndex(i)
         renderer.setViewpoint(30, 30, 0, 0.7, 25)
 
-        with TemporaryFile() as f, stdout_redirected(f):
-            rendering, alpha = renderer.render(load_model=True,
+        renderer.render(load_model=True, return_image=False,
                 clear_model=True, image_path=image_path)
 
         print('Saved at %s' % image_path)
@@ -317,6 +434,27 @@ def main():
             print(sum_time/(10))
             sum_time = 0
 
+        
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Render according to a task_split_file')
+    parser.add_argument('--task_file', type=str, default='', help='task split file')
+    parser.add_argument('--single', action='store_true', help='use single')
+    parser.add_argument('--test', action='store_true', help='test')
+    parser.add_argument('--model_class', type=str, default='02691156', help='model class')
+    parser.add_argument('--model_id', type=str, default='1a04e3eab45ca15dd86060f189eb133', help='model id')
+    
+    print(sys.argv)
+
+    argv = sys.argv[sys.argv.index("--") + 1:]
+    args = parser.parse_args(argv)
+
+    if args.test:
+        test()
+        exit(0)
+
+    if not args.single:
+        main(args)
+    else:
+        main_single(args)
